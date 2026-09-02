@@ -2,8 +2,23 @@ import pytest
 import numpy as np
 from pathlib import Path
 
-from forte2 import System, RHF, MCOptimizer, ASET, CI, State, CISolver
-from forte2.dsrg import DSRG_MRPT2
+from forte2 import (
+    System,
+    RHF,
+    GHF,
+    MCOptimizer,
+    ASET,
+    CI,
+    RelCI,
+    State,
+    CISolver,
+    RelCISolver,
+    SpinorUpcaster,
+    X2CParams,
+)
+from forte2.dsrg import DSRG_MRPT2, RelDSRG_MRPT2
+from forte2.lib import ints
+from forte2.data.atom_data import EH_TO_WN
 from forte2.helpers.comparisons import approx, approx_abs
 from forte2.orbitals import mo_overlap
 from forte2.state import EmbeddingMOSpace
@@ -622,3 +637,226 @@ def test_aset_noncontiguous_frozen_core_orbital_ordering():
     for index_A, index_B in ((index_A_occ, index_B_occ), (index_A_vir, index_B_vir)):
         assert len(index_A) > 0 and len(index_B) > 0
         assert diag_P[index_A].min() > diag_P[index_B].max()
+
+
+def test_aset_two_component_matches_nonrelativistic():
+    """
+    Two-component ASET must reproduce its one-component counterpart when the
+    Hamiltonian carries no spin-orbit coupling.
+
+    The same HNNF chain is run twice: once in real spatial orbitals, and once
+    with the reference upcast to spinors and given a random complex phase, so
+    that the fragment projector, the partition, and the semicanonicalization
+    are all exercised in complex arithmetic on orbitals with no fixed phase.
+    """
+    eci = -206.084138520360
+
+    xyz = """
+    N       -1.1226987119      2.0137160725     -0.0992218410
+    N       -0.1519067161      1.2402226172     -0.0345618482
+    H        0.7253474870      1.7181546089     -0.2678695726
+    F       -2.2714806355      1.3880717623      0.2062454513
+    """
+
+    def build_mcscf():
+        system = System(
+            xyz=xyz,
+            basis_set="sto-3g",
+            auxiliary_basis_set="def2-universal-JKFIT",
+        )
+        rhf = RHF(charge=0, e_tol=1e-12)(system)
+        ci_solver = CISolver(
+            State(nel=24, multiplicity=1, ms=0.0),
+            core_orbitals=10,
+            active_orbitals=4,
+        )
+        return system, MCOptimizer(ci_solver)(rhf)
+
+    system, mc = build_mcscf()
+    aset = ASET(
+        fragment=["N", "H"],
+        frozen_core_orbitals=3,
+        cutoff_method="threshold",
+        cutoff=0.99,
+    )(mc)
+    ci = CI(State(system=system, multiplicity=1, ms=0.0))(aset)
+    ci.run()
+
+    _, mc_2c = build_mcscf()
+    upcast = SpinorUpcaster(apply_random_phase=True, rng=1234)(mc_2c)
+    relmc = MCOptimizer(RelCISolver(nel=24))(upcast)
+    aset_2c = ASET(
+        fragment=["N", "H"],
+        frozen_core_orbitals=6,
+        cutoff_method="threshold",
+        cutoff=0.99,
+    )(relmc)
+    relci = RelCI(nel=24)(aset_2c)
+    relci.run()
+
+    assert ci.E == approx(eci)
+    assert np.real(relci.E) == approx(eci)
+    assert np.real(relmc.E) == approx(mc.E)
+
+    # The spinor partition must be the spatial partition with each orbital
+    # replaced by its Kramers pair (2i, 2i+1), with no pair split across the
+    # fragment/environment boundary.
+    def kramers_doubled(indices):
+        return [j for i in indices for j in (2 * i, 2 * i + 1)]
+
+    space, space_2c = aset.mo_space, aset_2c.mo_space
+    assert space_2c.frozen_core_indices == kramers_doubled(space.frozen_core_indices)
+    assert space_2c.core_indices == kramers_doubled(space.core_indices)
+    assert space_2c.active_indices == kramers_doubled(space.active_indices)
+    assert space_2c.virtual_indices == kramers_doubled(space.virtual_indices)
+    assert space_2c.frozen_virtual_indices == kramers_doubled(
+        space.frozen_virtual_indices
+    )
+
+
+def kramers_closure_error(system, C, indices):
+    """
+    Measure how far the subspace spanned by ``C[:, indices]`` is from being
+    closed under time reversal.
+
+    The time-reversal operator on a spinor basis ordered as [alpha; beta] is
+    ``Theta = (-i sigma_y) K``, with ``K`` complex conjugation. If the subspace
+    is closed, ``K_vu = <phi_v|Theta|phi_u>`` is unitary, so the deviation of
+    ``K K^dagger`` from the identity measures the leakage. A nonzero value means
+    a Kramers pair straddles the boundary of the subspace, which silently breaks
+    Kramers degeneracy in any method built on that partition.
+    """
+    indices = np.asarray(indices, dtype=int)
+    if indices.size == 0:
+        return 0.0
+    ao_ovlp = ints.overlap(system.basis)
+    nbf = ao_ovlp.shape[0]
+    ovlp = np.kron(np.eye(2), ao_ovlp)
+    theta = np.zeros((2 * nbf, 2 * nbf))
+    theta[:nbf, nbf:] = -np.eye(nbf)
+    theta[nbf:, :nbf] = np.eye(nbf)
+    X = C[:, indices]
+    K = X.conj().T @ ovlp @ theta @ X.conj()
+    return np.abs(K @ K.conj().T - np.eye(indices.size)).max()
+
+
+def test_aset_two_component_relativistic():
+    """
+    Two-component ASET on the methylthiyl radical, embedding the sulfur atom in
+    a frozen CH3 environment with spin-orbit coupling treated variationally.
+
+    Three chains share one full-system SA-CASSCF reference: no embedding, ASET
+    with every atom in the fragment, and ASET on sulfur alone. The first two
+    must agree exactly, which pins the partitioning machinery without relying on
+    an external reference; the third is the embedded result.
+
+    The state averaging covers the complete six-determinant model space so that
+    every orbital subspace is closed under time reversal. A partition that
+    splits a Kramers pair leaves the CASCI energies degenerate but breaks the
+    degeneracy of the DSRG effective Hamiltonian by several wavenumbers, so the
+    partition is checked explicitly rather than inferred from the energies.
+    """
+    emcscf = -438.040123238662
+    esplit_mcscf = 347.15629
+    edsrg_full = -438.314646639763
+    esplit_dsrg_full = 337.03105
+    edsrg_aset = -438.140777365368
+    esplit_dsrg_aset = 342.38198
+
+    xyz = """
+    S   0.0000000000   0.0000000000   1.0272000000
+    C   0.0000000000   0.0000000000  -0.7566000000
+    H   0.0000000000   1.0244000000  -1.1017000000
+    H   0.8871000000  -0.5122000000  -1.1017000000
+    H  -0.8871000000  -0.5122000000  -1.1017000000
+    """
+
+    system = System(
+        xyz=xyz,
+        basis_set="cc-pvdz",
+        auxiliary_basis_set="cc-pvtz-jkfit",
+        x2c=X2CParams(x2c_type="so", x2c_model="1e", snso_type="row-dependent"),
+    )
+    scf = GHF(charge=0)(system)
+    mc = MCOptimizer(
+        RelCISolver(nel=25, nroots=6, core_orbitals=20, active_orbitals=6)
+    )(scf)
+    mc.run()
+
+    def doublet_splitting(eigvals):
+        """Separation of the two Kramers doublets of the 2E ground state."""
+        e = np.sort(np.real(np.asarray(eigvals)))
+        return (np.mean(e[2:4]) - np.mean(e[:2])) * EH_TO_WN
+
+    def kramers_splittings(eigvals):
+        e = np.sort(np.real(np.asarray(eigvals)))
+        return [(e[2 * i + 1] - e[2 * i]) * EH_TO_WN for i in range(len(e) // 2)]
+
+    def assert_kramers_closed(method):
+        space, C = method.mo_space, method.mos.C[0]
+        for indices in (
+            space.frozen_core_indices,
+            space.core_indices,
+            space.active_indices,
+            space.virtual_indices,
+            space.frozen_virtual_indices,
+        ):
+            assert kramers_closure_error(system, C, indices) < 1e-10
+
+    def run_chain(parent):
+        # RelCISolver, not RelCI: the DSRG reference relaxation re-invokes the
+        # solver, and RelCI re-applies its final-orbital rotation on every call.
+        ci = RelCISolver(nel=25, nroots=6)(parent)
+        ci.run()
+        # Read the CASCI energy before the DSRG step, whose reference
+        # relaxation re-solves the CI problem in place with a dressed
+        # Hamiltonian and overwrites ci.E.
+        e_casci = np.mean(np.real(np.atleast_1d(ci.E)))
+        dsrg = RelDSRG_MRPT2(flow_param=0.5, relax_reference="once")(ci)
+        dsrg.run()
+        return e_casci, dsrg
+
+    assert_kramers_closed(mc)
+    e_casci_bare, dsrg_bare = run_chain(mc)
+
+    aset_all = ASET(fragment=["S", "C", "H"], cutoff_method="threshold", cutoff=0.01)(
+        mc
+    )
+    _, dsrg_all = run_chain(aset_all)
+
+    aset_s = ASET(fragment=["S"], cutoff_method="threshold", cutoff=0.5)(mc)
+    e_casci_s, dsrg_s = run_chain(aset_s)
+
+    assert np.real(mc.E) == approx(emcscf)
+    assert doublet_splitting(mc.ci_solver.evals_flat) == approx_abs(esplit_mcscf, 1e-2)
+
+    # Assigning every atom to the fragment leaves nothing frozen, so the
+    # embedded chain must reproduce the unembedded one exactly.
+    assert aset_all.mo_space.frozen_core_indices == []
+    assert aset_all.mo_space.frozen_virtual_indices == []
+    assert np.real(dsrg_all.E) == approx(np.real(dsrg_bare.E))
+    assert np.real(dsrg_bare.E) == approx(edsrg_full)
+    assert doublet_splitting(dsrg_bare.relax_eigvals) == approx_abs(
+        esplit_dsrg_full, 1e-2
+    )
+
+    # Embedding sulfur freezes the CH3 orbitals. ASET(0) leaves the active
+    # space untouched, so the CASCI energy is unchanged; only the correlated
+    # step sees the smaller orbital space.
+    space = aset_s.mo_space
+    assert len(space.frozen_core_indices) == 8
+    assert len(space.core_indices) == 12
+    assert space.nactv == 6
+    assert len(space.virtual_indices) == 18
+    assert len(space.frozen_virtual_indices) == 50
+    assert e_casci_s == approx(e_casci_bare)
+    assert np.real(dsrg_s.E) == approx(edsrg_aset)
+    assert doublet_splitting(dsrg_s.relax_eigvals) == approx_abs(esplit_dsrg_aset, 1e-2)
+
+    # The fragment projector is spin-independent, so every subspace it defines
+    # stays closed under time reversal and the DSRG roots remain Kramers
+    # degenerate after embedding.
+    assert_kramers_closed(aset_all)
+    assert_kramers_closed(aset_s)
+    for dsrg in (dsrg_bare, dsrg_all, dsrg_s):
+        assert max(kramers_splittings(dsrg.relax_eigvals)) < 1e-2

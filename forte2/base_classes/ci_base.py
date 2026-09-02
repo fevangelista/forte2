@@ -37,6 +37,14 @@ class CIBase(ActiveSpaceSolver):
 
     def __call__(self, parent_method):
         self._register_parent_method(parent_method)
+        # A bare solver never rotates its orbitals, so it hands downstream
+        # methods the basis it was given. Report the parent's final_orbitals so
+        # that a method requiring a particular basis (e.g. DSRG, which requires
+        # semicanonical orbitals) can be chained onto a solver. CI/RelCI and the
+        # selected-CI drivers declare final_orbitals as a field of their own and
+        # are left untouched.
+        if not hasattr(self, "final_orbitals"):
+            self.final_orbitals = getattr(parent_method, "final_orbitals", "original")
         return self
 
     def reset(self):
